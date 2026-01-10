@@ -121,14 +121,80 @@ st.session_state.selected_feature = st.sidebar.selectbox(
     index=FEATURES.index(st.session_state.selected_feature)
 )
 
-# default input values
-defaults = df[FEATURES].median().to_dict() if df is not None else {FEATURES[0]:20.0, FEATURES[1]:1.99, FEATURES[2]:3.5}
-st.sidebar.subheader("Input patient features")
-beta1 = st.sidebar.number_input("I β-hCG (mIU/mL)", value=float(defaults[FEATURES[0]]))
-beta2 = st.sidebar.number_input("II β-hCG (mIU/mL)", value=float(defaults[FEATURES[1]]))
-amh = st.sidebar.number_input("AMH (ng/mL)", value=float(defaults[FEATURES[2]]))
+# ---- New: choose whether to explain a manual input or a dataset patient ----
+st.sidebar.markdown("---")
+st.sidebar.subheader("Input patient source")
 
-sample_df = pd.DataFrame([{FEATURES[0]: beta1, FEATURES[1]: beta2, FEATURES[2]: amh}])[FEATURES]
+# If df exists allow selecting from dataset, otherwise only manual
+if df is not None:
+    sample_source = st.sidebar.radio("Explain:", ("Manual input", "Select from dataset"))
+else:
+    sample_source = "Manual input"
+
+# Helper to get default values (from dataset median or fallback)
+defaults = df[FEATURES].median().to_dict() if df is not None else {FEATURES[0]:20.0, FEATURES[1]:1.99, FEATURES[2]:3.5}
+
+selected_dataset_index = None
+if sample_source == "Select from dataset":
+    # prefer an 'id' like column if present for nicer labels
+    id_col = None
+    if df is not None:
+        for candidate in ["id", "patient_id", "ID", "PatientID"]:
+            if candidate in df.columns:
+                id_col = candidate
+                break
+
+    # build options: use index; if id_col exists show index — id in the label
+    if df is not None:
+        if id_col is not None:
+            idx_choice = st.sidebar.selectbox("Choose patient (index — id)", options=list(df.index), format_func=lambda i: f"{i} — {df.loc[i, id_col]}")
+            selected_dataset_index = int(idx_choice)
+        else:
+            idx_choice = st.sidebar.selectbox("Choose patient (index)", options=list(df.index))
+            selected_dataset_index = int(idx_choice)
+
+    # show selected patient values (read-only) and also allow using them as manual base
+    if selected_dataset_index is not None:
+        sel_row = df.loc[selected_dataset_index, FEATURES]
+        st.sidebar.markdown("**Selected patient values:**")
+        st.sidebar.write(sel_row.to_frame(name="value"))
+
+        # Offer a button to copy dataset values to manual inputs (optional)
+        if st.sidebar.button("Use these values (load to manual inputs)"):
+            # store loaded values in session so manual controls reflect them below
+            st.session_state["_loaded_beta1"] = float(sel_row[FEATURES[0]])
+            st.session_state["_loaded_beta2"] = float(sel_row[FEATURES[1]])
+            st.session_state["_loaded_amh"] = float(sel_row[FEATURES[2]])
+
+# ---- Manual input controls (shown always so user can edit or preview) ----
+st.sidebar.markdown("---")
+st.sidebar.subheader("Input patient features (manual)")
+
+# If user loaded dataset values into session_state use those as defaults
+def _get_default_feat(feat):
+    key_map = {
+        FEATURES[0]: "_loaded_beta1",
+        FEATURES[1]: "_loaded_beta2",
+        FEATURES[2]: "_loaded_amh",
+    }
+    if key_map[feat] in st.session_state:
+        return float(st.session_state[key_map[feat]])
+    return float(defaults.get(feat, 0.0))
+
+beta1 = st.sidebar.number_input("I β-hCG (mIU/mL)", value=_get_default_feat(FEATURES[0]))
+beta2 = st.sidebar.number_input("II β-hCG (mIU/mL)", value=_get_default_feat(FEATURES[1]))
+amh = st.sidebar.number_input("AMH (ng/mL)", value=_get_default_feat(FEATURES[2]))
+
+# Build sample_df depending on source
+if sample_source == "Select from dataset" and df is not None and selected_dataset_index is not None:
+    # Use the selected dataset row as the sample (guaranteed feature ordering)
+    sample_df = df.loc[[selected_dataset_index]][FEATURES].copy().reset_index(drop=True)
+else:
+    # Use manual inputs
+    sample_df = pd.DataFrame([{FEATURES[0]: beta1, FEATURES[1]: beta2, FEATURES[2]: amh}])[FEATURES]
+
+# Show a small badge of which source is being used
+st.sidebar.markdown(f"**Active sample source:** `{sample_source}`" + (f" — index {selected_dataset_index}" if selected_dataset_index is not None else ""))
 
 st.title("PCOS Prediction + Explainable AI ")
 st.markdown("Global feature selector is shared across tabs. Selected: **`%s`**" % st.session_state.selected_feature)
@@ -153,8 +219,8 @@ if st.sidebar.button("Predict PCOS"):
         st.table(sample_df.T.rename(columns={0:"value"}))
 
     # ---------- Tabs ----------
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📈 PDP + ICE", "🟢 LIME", "🔵 SHAP", "🟣 ANCHOR", "📊 XAI Comparison", "🎯 Feature Influence"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["📈 PDP + ICE", "🟢 LIME", "🔵 SHAP", "🟣 ANCHOR", "📊 XAI Comparison", "🎯 Feature Influence", "🟠 ALE"]
     )
 
     # ---------------- TAB 1: PDP + ICE ----------------
@@ -330,265 +396,514 @@ if st.sidebar.button("Predict PCOS"):
             st.write("Anchor rule:")
             st.info(rule)
             st.write(f"Precision: {precision_val:.3f} | Coverage: {coverage_val:.3f}")
+            # --- Visualize Anchor rule effect (add inside tab4 after computing `exp`) ---
+            import re
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+
+            # get the rule text (robust)
+            try:
+                rule_text = " AND ".join(exp.names()) if hasattr(exp, "names") else str(exp)
+            except Exception:
+                rule_text = str(exp)
+
+            # try to extract numeric threshold for i___beta_hcgmiu_ml
+            thresh = None
+            m = re.search(r"i___beta_hcgmiu_ml\s*(?:<=|<|>)\s*([0-9.+-eE]+)", rule_text)
+            if m:
+                try:
+                    thresh = float(m.group(1))
+                except Exception:
+                    thresh = None
+
+            # fallback default (if parsing failed)
+            if thresh is None:
+                thresh = 1.99
+
+            # Prepare dataset predictions & probabilities
+            X_all = df[FEATURES].copy()
+            try:
+                X_pre_all = preprocessor.transform(X_all)
+                probs = model.predict_proba(X_pre_all)[:, 1]
+                preds = model.predict(X_pre_all)
+            except Exception:
+                probs = model.predict_proba(X_all.values)[:, 1]
+                preds = model.predict(X_all.values)
+
+            X_all["_prob"] = probs
+            X_all["_pred"] = preds
+
+            # compute rule mask & metrics
+            mask = X_all["i___beta_hcgmiu_ml"] <= thresh
+            coverage_calc = mask.mean()
+            if mask.sum() > 0:
+                majority_class = X_all.loc[mask, "_pred"].mode().iat[0]
+                precision_calc = (X_all.loc[mask, "_pred"] == majority_class).mean()
+            else:
+                precision_calc = float("nan")
+
+            # Build figure
+            fig, axes = plt.subplots(3, 1, figsize=(9, 12), constrained_layout=True)
+
+            # Panel 1: histogram
+            ax = axes[0]
+            sns.histplot(data=X_all, x="i___beta_hcgmiu_ml", hue="_pred", bins=30, multiple="layer", alpha=0.6, ax=ax)
+            ax.axvline(thresh, color="black", linestyle="--", linewidth=2, label=f"Anchor threshold = {thresh}")
+            ax.set_title("Distribution of I β-hCG by model predicted class (0=no PCOS, 1=PCOS)")
+            ax.set_xlabel("i___beta_hcgmiu_ml")
+            ax.legend()
+
+            # Panel 2: scatter
+            ax = axes[1]
+            ax.scatter(X_all["i___beta_hcgmiu_ml"], X_all["_prob"], alpha=0.6, s=18)
+            ax.axvline(thresh, color="black", linestyle="--", linewidth=2)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_title("Model predicted probability (PCOS=1) vs I β-hCG")
+            ax.set_xlabel("i___beta_hcgmiu_ml")
+            ax.set_ylabel("Predicted probability (PCOS=1)")
+
+            # Panel 3: precision & coverage bar
+            ax = axes[2]
+            metrics = {"Coverage (%)": coverage_calc * 100, "Precision (%)": precision_calc * 100}
+            names = list(metrics.keys())
+            vals = list(metrics.values())
+            bars = ax.barh(names, vals, color=["#2a9d8f", "#e76f51"])
+            for i, v in enumerate(vals):
+                ax.text(v + 1, i, f"{v:.1f}%", va="center")
+            ax.set_xlim(0, 105)
+            ax.set_title("Anchor rule metrics (computed from dataset & model)")
+            ax.set_xlabel("Percent")
+
+            st.pyplot(fig)
+
+            # Show example rows
+            st.write(f"Examples (first 10) where rule holds (i___beta_hcgmiu_ml <= {thresh:.2f}):")
+            st.dataframe(X_all.loc[mask, FEATURES + ['_pred', '_prob']].head(10))
+
+            st.write("Examples (first 10) where rule does NOT hold:")
+            st.dataframe(X_all.loc[~mask, FEATURES + ['_pred', '_prob']].head(10))
+
         except Exception as e:
             st.error(f"Anchor failed: {e}")
 
-    # ---------------- TAB 5: XAI Comparison (metrics) ----------------
+    # ---------------- TAB: XAI Comparison (PDP + ICE + LIME + SHAP + ANCHOR + ALE) ----------------
     with tab5:
-        st.subheader("XAI Method Comparison (quantitative)")
+        st.subheader("📊 Quantitative Comparison of XAI Methods")
+
         if df is None:
-            st.warning("Dataset required")
+            st.warning("Dataset required for comparison.")
+            st.stop()
+
+        X_pre_all = preprocessor.transform(df[FEATURES])
+        rng = np.random.RandomState(42)
+
+        n_eval = st.slider(
+            "Number of instances for comparison",
+            min_value=20,
+            max_value=min(200, X_pre_all.shape[0]),
+            value=60
+        )
+
+        idxs = rng.choice(X_pre_all.shape[0], n_eval, replace=False)
+
+        # ===================== LIME Fidelity =====================
+        lime_explainer = LimeTabularExplainer(
+            training_data=np.array(X_pre_all),
+            feature_names=FEATURES,
+            class_names=["No PCOS", "PCOS"],
+            mode="classification"
+        )
+
+        lime_scores = []
+        for i in idxs:
+            try:
+                exp = lime_explainer.explain_instance(
+                    X_pre_all[i],
+                    model.predict_proba,
+                    num_features=len(FEATURES)
+                )
+                lime_scores.append(exp.score)
+            except Exception:
+                lime_scores.append(np.nan)
+
+        lime_mean = float(np.nanmean(lime_scores))
+
+        # ===================== SHAP Additivity Error =====================
+        try:
+            shap_explainer = shap.TreeExplainer(model)
+            shap_vals = shap_explainer(X_pre_all[idxs])
+
+            vals = shap_vals.values
+            if vals.ndim == 3:
+                vals = vals[:, 1, :]
+
+            base = shap_explainer.expected_value
+            if isinstance(base, (list, np.ndarray)):
+                base = base[1]
+
+            preds = model.predict_proba(X_pre_all[idxs])[:, 1]
+            preds_shap = np.sum(vals, axis=1) + base
+            shap_err = np.mean(np.abs(preds - preds_shap))
+        except Exception:
+            shap_err = np.nan
+
+        # ===================== ICE Variance =====================
+        feat = st.session_state.selected_feature
+        grid = np.linspace(df[feat].min(), df[feat].max(), 20)
+
+        ice_curves = []
+        for i in idxs[:40]:
+            row = df.iloc[i].copy()
+            curve = []
+            for g in grid:
+                row[feat] = g
+                pred = model.predict_proba(
+                    preprocessor.transform(pd.DataFrame([row])[FEATURES])
+                )[:, 1][0]
+                curve.append(pred)
+            ice_curves.append(curve)
+
+        ice_var = float(np.mean(np.var(np.array(ice_curves), axis=0)))
+
+        # ===================== ANCHOR Precision & Coverage =====================
+        anchor_explainer = anchor_tabular.AnchorTabularExplainer(
+            class_names=["No PCOS", "PCOS"],
+            feature_names=FEATURES,
+            train_data=df[FEATURES].values
+        )
+
+        precisions, coverages = [], []
+        for i in idxs[:25]:
+            try:
+                exp = anchor_explainer.explain_instance(
+                    df[FEATURES].iloc[i].values,
+                    model.predict,
+                    threshold=0.95
+                )
+                precisions.append(exp.precision())
+                coverages.append(exp.coverage())
+            except Exception:
+                precisions.append(np.nan)
+                coverages.append(np.nan)
+
+        anchor_prec = float(np.nanmean(precisions))
+        anchor_cov = float(np.nanmean(coverages))
+
+        # ===================== ALE Mean Absolute Effect (SAFE) =====================
+        values = df[feat].values.astype(float)
+
+        # create bins safely
+        bins = np.quantile(values, np.linspace(0, 1, 11))
+        bins = np.unique(bins)
+
+        ale_effects = []
+
+        if len(bins) > 1:
+            for i in range(len(bins) - 1):
+                low, high = bins[i], bins[i + 1]
+                mask = (values >= low) & (values < high)
+
+                if mask.sum() == 0:
+                    continue
+
+                X_low = df.loc[mask, FEATURES].copy()
+                X_high = X_low.copy()
+                X_low[feat] = low
+                X_high[feat] = high
+
+                p_low = model.predict_proba(preprocessor.transform(X_low))[:, 1]
+                p_high = model.predict_proba(preprocessor.transform(X_high))[:, 1]
+
+                ale_effects.append(np.mean(p_high - p_low))
+
+        # FINAL safe value
+        if len(ale_effects) == 0:
+            ale_score = 0.0  # <-- IMPORTANT
         else:
-            X_pre_all = preprocessor.transform(df[FEATURES])
-            n_eval = st.slider("Instances to sample for comparison", min_value=20, max_value=min(200, X_pre_all.shape[0]), value=60)
-            rng = np.random.RandomState(0)
-            idxs = rng.choice(X_pre_all.shape[0], n_eval, replace=False)
+            ale_score = float(np.mean(np.abs(ale_effects)))
 
-            # LIME fidelity (approx by surrogate R2)
-            lime_explainer_cmp = LimeTabularExplainer(training_data=np.array(X_pre_all), feature_names=FEATURES, class_names=["No PCOS","PCOS"], mode="classification")
-            lime_scores = []
-            for i in idxs:
-                try:
-                    exp_l = lime_explainer_cmp.explain_instance(X_pre_all[i], model.predict_proba, num_features=len(FEATURES))
-                    s = getattr(exp_l, "score", None)
-                    if s is None:
-                        std = np.std(X_pre_all, axis=0, ddof=1)
-                        scale = np.maximum(1e-6, 0.1 * std)
-                        perturbs = X_pre_all[i].reshape(1,-1) + np.random.normal(0, scale, size=(200, X_pre_all.shape[1]))
-                        y_hat = model.predict_proba(perturbs)[:,1]
-                        lr = LinearRegression().fit(perturbs, y_hat)
-                        s = lr.score(perturbs, y_hat)
-                    lime_scores.append(float(s))
-                except Exception:
-                    lime_scores.append(np.nan)
-            lime_mean, lime_std = float(np.nanmean(lime_scores)), float(np.nanstd(lime_scores))
+        # ===================== RESULTS TABLE =====================
+        comp_df = pd.DataFrame({
+            "XAI Method": [
+                "LIME Fidelity (R²)",
+                "SHAP Additivity Error",
+                f"ICE Variance ({feat})",
+                "ANCHOR Precision",
+                "ANCHOR Coverage",
+                f"ALE Mean |Effect| ({feat})"
+            ],
+            "Value": [
+                lime_mean,
+                shap_err,
+                ice_var,
+                anchor_prec,
+                anchor_cov,
+                ale_score
+            ]
+        })
 
-            # SHAP additivity error
-            try:
-                try:
-                    shap_cmp_expl = shap.TreeExplainer(model)
-                except Exception:
-                    shap_cmp_expl = shap.Explainer(model, masker="tree")
-                shap_vals_cmp, _ = safe_shap_values_and_array(shap_cmp_expl, X_pre_all[idxs], prefer_class=1, use_check_additivity=True)
-                preds = model.predict_proba(X_pre_all[idxs])[:,1]
-                # compute base (best-effort using expected_value)
-                ev = getattr(shap_cmp_expl, "expected_value", None)
-                if ev is not None:
-                    barr = np.atleast_1d(ev)
-                    if barr.size > 1:
-                        base_pos = np.repeat(float(barr[1]), len(idxs))
-                    else:
-                        base_pos = np.repeat(float(barr.ravel()[-1]), len(idxs))
-                else:
-                    base_pos = np.zeros(len(idxs))
-                pred_from_shap = np.sum(shap_vals_cmp, axis=1) + base_pos
-                shap_errs = np.abs(preds - pred_from_shap)
-                shap_mean, shap_std = float(np.mean(shap_errs)), float(np.std(shap_errs))
-            except Exception:
-                shap_mean, shap_std = np.nan, np.nan
+        numeric_cols = comp_df.select_dtypes(include=[np.number]).columns
 
-            # ICE variance (for selected feature)
-            try:
-                feat = st.session_state.selected_feature
-                sample_n = min(60, df.shape[0])
-                chosen = rng.choice(df.shape[0], sample_n, replace=False)
-                grid_points = 20
-                grid = np.linspace(df[feat].min(), df[feat].max(), grid_points)
-                curves = []
-                for r in chosen:
-                    row = df.iloc[r].copy()
-                    preds_curve = []
-                    for val in grid:
-                        row2 = row.copy()
-                        row2[feat] = val
-                        x_t = preprocessor.transform(pd.DataFrame([row2])[FEATURES])
-                        preds_curve.append(float(model.predict_proba(x_t)[:,1][0]))
-                    curves.append(preds_curve)
-                curves = np.array(curves)
-                ice_var = float(np.mean(np.var(curves, axis=0)))
-            except Exception:
-                ice_var = np.nan
+        st.dataframe(
+            comp_df.style.format(
+                {col: "{:.4f}" for col in numeric_cols}
+            )
+        )
 
-            # ANCHOR precision & coverage (sample subset)
-            try:
-                anchor_cmp = anchor_tabular.AnchorTabularExplainer(class_names=["No PCOS","PCOS"], feature_names=FEATURES, train_data=df[FEATURES].values)
-                anchor_idxs = idxs[:min(30, len(idxs))]
-                precs, covs = [], []
-                for ii in anchor_idxs:
-                    try:
-                        e = anchor_cmp.explain_instance(df[FEATURES].iloc[ii].values, model.predict, threshold=0.95, delta=0.1)
-                        p = e.precision() if callable(getattr(e,"precision",None)) else getattr(e,"precision",np.nan)
-                        c = e.coverage() if callable(getattr(e,"coverage",None)) else getattr(e,"coverage",np.nan)
-                        precs.append(float(p))
-                        covs.append(float(c))
-                    except Exception:
-                        precs.append(np.nan); covs.append(np.nan)
-                prec_mean = float(np.nanmean(precs)) if len(precs)>0 else np.nan
-                cov_mean = float(np.nanmean(covs)) if len(covs)>0 else np.nan
-            except Exception:
-                prec_mean, cov_mean = np.nan, np.nan
+        # ===================== BAR CHART =====================
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.barh(comp_df["XAI Method"], comp_df["Value"])
+        ax.set_title("XAI Method Comparison")
+        st.pyplot(fig)
 
-            # show table & plot
-            df_comp = pd.DataFrame({
-                "Method":["LIME fidelity (R2)", "SHAP additivity err (mean)", f"ICE var ({st.session_state.selected_feature})", "Anchor precision (mean)", "Anchor coverage (mean)"],
-                "Mean":[lime_mean, shap_mean, ice_var, prec_mean, cov_mean],
-                "Std/Notes":[lime_std, shap_std, "-", "-", "-"]
-            })
-            st.dataframe(df_comp)
+        # ===================== INTERPRETATION =====================
+        st.info("""
+        **How to read this table:**
+        - Higher LIME fidelity → better local approximation
+        - Lower SHAP additivity error → more consistent explanations
+        - Lower ICE variance → more stable individual behavior
+        - Higher Anchor precision → more reliable rules
+        - Higher ALE effect → stronger, correlation-aware influence
+        """)
 
-            figc, axc = plt.subplots(figsize=(8,3))
-            vals_plot = [v if not np.isnan(v) else 0 for v in df_comp["Mean"].values]
-            axc.barh(df_comp["Method"], vals_plot)
-            axc.set_title("XAI comparison (means)")
-            st.pyplot(figc)
-
-    # ---------------- TAB 6: Feature Influence Dashboard ----------------
+    # ---------------- TAB 6: Feature Influence Dashboard (WITH ALE) ----------------
     with tab6:
-        st.subheader("Feature Influence Dashboard (combined per-feature metrics)")
+        st.subheader("🎯 Feature Influence Dashboard (PDP + ICE + LIME + SHAP + ANCHOR + ALE)")
 
         feats = FEATURES.copy()
         results = {f: {} for f in feats}
 
         X_pre_all = preprocessor.transform(df[FEATURES])
-        n_sample_shap = min(300, X_pre_all.shape[0])
         rng = np.random.RandomState(1)
-        shard = rng.choice(X_pre_all.shape[0], n_sample_shap, replace=False)
 
-        # SHAP explainer once (robust)
+        # ---------- SHAP (once) ----------
         try:
-            try:
-                shap_expl_full = shap.TreeExplainer(model)
-            except Exception:
-                shap_expl_full = shap.Explainer(model, masker="tree")
-            shap_vals_full_arr, _ = safe_shap_values_and_array(shap_expl_full, X_pre_all[shard], prefer_class=1, use_check_additivity=True)
+            shap_expl = shap.TreeExplainer(model)
+            shap_vals = shap_expl(X_pre_all)
+            vals = shap_vals.values
+            if vals.ndim == 3:
+                vals = vals[:, 1, :]
         except Exception:
-            shap_vals_full_arr = None
+            vals = None
 
-        lime_explainer_all = LimeTabularExplainer(training_data=np.array(X_pre_all), feature_names=FEATURES, class_names=["No PCOS", "PCOS"], mode="classification")
+        # ---------- LIME ----------
+        lime_expl = LimeTabularExplainer(
+            training_data=np.array(X_pre_all),
+            feature_names=FEATURES,
+            class_names=["No PCOS", "PCOS"],
+            mode="classification"
+        )
 
-        anchor_expl_all = anchor_tabular.AnchorTabularExplainer(class_names=["No PCOS","PCOS"], feature_names=FEATURES, train_data=df[FEATURES].values)
+        # ---------- ANCHOR ----------
+        anchor_expl = anchor_tabular.AnchorTabularExplainer(
+            class_names=["No PCOS", "PCOS"],
+            feature_names=FEATURES,
+            train_data=df[FEATURES].values
+        )
 
         for feat in feats:
-            # PDP slope (mean response)
+            # ================= PDP SLOPE =================
             try:
-                grid_pts = 20
-                grid = np.linspace(df[feat].min(), df[feat].max(), grid_pts)
+                grid = np.linspace(df[feat].min(), df[feat].max(), 20)
                 mean_preds = []
                 for g in grid:
                     X_mod = df[FEATURES].copy()
                     X_mod[feat] = g
-                    X_mod_pre = preprocessor.transform(X_mod)
-                    preds = model.predict_proba(X_mod_pre)[:,1]
+                    preds = model.predict_proba(preprocessor.transform(X_mod))[:, 1]
                     mean_preds.append(np.mean(preds))
-                lr = LinearRegression().fit(grid.reshape(-1,1), np.array(mean_preds))
-                slope = float(lr.coef_[0])
-                results[feat]["pdp_abs_slope"] = abs(slope)
+                lr = LinearRegression().fit(grid.reshape(-1, 1), mean_preds)
+                results[feat]["PDP |slope|"] = abs(lr.coef_[0])
             except Exception:
-                results[feat]["pdp_abs_slope"] = np.nan
+                results[feat]["PDP |slope|"] = np.nan
 
-            # ICE variance (mean var across grid)
+            # ================= ICE VARIANCE =================
             try:
-                sample_n = min(80, df.shape[0])
-                idxs_ice = rng.choice(df.shape[0], sample_n, replace=False)
-                grid_pts = 20
-                grid = np.linspace(df[feat].min(), df[feat].max(), grid_pts)
+                idxs = rng.choice(df.shape[0], min(60, df.shape[0]), replace=False)
+                grid = np.linspace(df[feat].min(), df[feat].max(), 20)
                 curves = []
-                for ii in idxs_ice:
-                    row = df.iloc[ii].copy()
-                    preds_c = []
+                for i in idxs:
+                    row = df.iloc[i].copy()
+                    curve = []
                     for g in grid:
-                        r2 = row.copy()
-                        r2[feat] = g
-                        x_t = preprocessor.transform(pd.DataFrame([r2])[FEATURES])
-                        preds_c.append(float(model.predict_proba(x_t)[:,1][0]))
-                    curves.append(preds_c)
-                curves_np = np.array(curves)
-                results[feat]["ice_var"] = float(np.mean(np.var(curves_np, axis=0)))
+                        row[feat] = g
+                        p = model.predict_proba(
+                            preprocessor.transform(pd.DataFrame([row])[FEATURES])
+                        )[:, 1][0]
+                        curve.append(p)
+                    curves.append(curve)
+                results[feat]["ICE variance"] = float(np.mean(np.var(curves, axis=0)))
             except Exception:
-                results[feat]["ice_var"] = np.nan
+                results[feat]["ICE variance"] = np.nan
 
-            # LIME avg abs weight
+            # ================= LIME =================
             try:
-                n_lime = min(80, X_pre_all.shape[0])
-                idxs_l = rng.choice(X_pre_all.shape[0], n_lime, replace=False)
-                abs_weights = []
-                for ii in idxs_l:
-                    try:
-                        expl = lime_explainer_all.explain_instance(X_pre_all[ii], model.predict_proba, num_features=len(FEATURES))
-                        pairs = expl.as_list()
-                        found = None
-                        for name, w in pairs:
-                            if feat in name:
-                                found = abs(w); break
-                        if found is None:
-                            found = 0.0
-                        abs_weights.append(float(found))
-                    except Exception:
-                        abs_weights.append(np.nan)
-                results[feat]["lime_avg_abs_w"] = float(np.nanmean(abs_weights))
+                idxs = rng.choice(X_pre_all.shape[0], min(60, X_pre_all.shape[0]), replace=False)
+                weights = []
+                for i in idxs:
+                    exp = lime_expl.explain_instance(
+                        X_pre_all[i], model.predict_proba, num_features=len(FEATURES)
+                    )
+                    for name, w in exp.as_list():
+                        if feat in name:
+                            weights.append(abs(w))
+                results[feat]["LIME |weight|"] = float(np.mean(weights))
             except Exception:
-                results[feat]["lime_avg_abs_w"] = np.nan
+                results[feat]["LIME |weight|"] = np.nan
 
-            # SHAP mean abs
+            # ================= SHAP =================
             try:
-                if shap_vals_full_arr is None:
-                    results[feat]["shap_mean_abs"] = np.nan
+                if vals is not None:
+                    idx = FEATURES.index(feat)
+                    results[feat]["SHAP mean |value|"] = float(np.mean(np.abs(vals[:, idx])))
                 else:
-                    idx_feat = FEATURES.index(feat)
-                    results[feat]["shap_mean_abs"] = float(np.mean(np.abs(shap_vals_full_arr[:, idx_feat])))
+                    results[feat]["SHAP mean |value|"] = np.nan
             except Exception:
-                results[feat]["shap_mean_abs"] = np.nan
+                results[feat]["SHAP mean |value|"] = np.nan
 
-            # Anchor presence rate
+            # ================= ANCHOR =================
             try:
-                anchor_idxs = rng.choice(df.shape[0], min(80, df.shape[0]), replace=False)
-                pres = []
-                precis = []
-                for ii in anchor_idxs[:40]:
-                    try:
-                        e = anchor_expl_all.explain_instance(df[FEATURES].iloc[ii].values, model.predict, threshold=0.95, delta=0.1)
-                        names = e.names() if hasattr(e, "names") else []
-                        name_str = " ".join(names).lower()
-                        pres.append(1.0 if feat.lower() in name_str else 0.0)
-                        p = e.precision() if callable(getattr(e,"precision",None)) else getattr(e,"precision",np.nan)
-                        precis.append(float(p) if p is not None else np.nan)
-                    except Exception:
-                        pres.append(np.nan); precis.append(np.nan)
-                results[feat]["anchor_presence_rate"] = float(np.nanmean(pres))
-                results[feat]["anchor_precision_mean"] = float(np.nanmean(precis))
+                idxs = rng.choice(df.shape[0], min(40, df.shape[0]), replace=False)
+                presence = []
+                for i in idxs:
+                    exp = anchor_expl.explain_instance(
+                        df[FEATURES].iloc[i].values, model.predict, threshold=0.95
+                    )
+                    rule = " ".join(exp.names()).lower()
+                    presence.append(1.0 if feat.lower() in rule else 0.0)
+                results[feat]["Anchor presence"] = float(np.mean(presence))
             except Exception:
-                results[feat]["anchor_presence_rate"] = np.nan
-                results[feat]["anchor_precision_mean"] = np.nan
+                results[feat]["Anchor presence"] = np.nan
 
-        # Build DataFrame
-        df_feats = pd.DataFrame.from_dict(results, orient="index")
-        norm_df = df_feats.copy()
-        for col in norm_df.columns:
-            colvals = norm_df[col].values.astype(float)
-            valid = ~np.isnan(colvals)
-            if valid.sum()>0:
-                mn, mx = np.nanmin(colvals), np.nanmax(colvals)
-                if np.isclose(mx, mn):
-                    norm_df[col] = np.where(np.isnan(colvals), np.nan, 1.0)
-                else:
-                    norm_df[col] = np.where(np.isnan(colvals), np.nan, (colvals - mn) / (mx - mn))
-            else:
-                norm_df[col] = np.nan
+            # ================= ALE =================
+            try:
+                values = df[feat].values
+                bins = np.unique(np.quantile(values, np.linspace(0, 1, 11)))
+                ale_vals = []
+                for i in range(len(bins) - 1):
+                    low, high = bins[i], bins[i + 1]
+                    mask = (values >= low) & (values < high)
+                    if mask.sum() == 0:
+                        continue
+                    X_low = df.loc[mask, FEATURES].copy()
+                    X_high = X_low.copy()
+                    X_low[feat] = low
+                    X_high[feat] = high
+                    p_low = model.predict_proba(preprocessor.transform(X_low))[:, 1]
+                    p_high = model.predict_proba(preprocessor.transform(X_high))[:, 1]
+                    ale_vals.append(np.mean(p_high - p_low))
+                results[feat]["ALE mean |effect|"] = float(np.mean(np.abs(ale_vals)))
+            except Exception:
+                results[feat]["ALE mean |effect|"] = np.nan
 
-        norm_df["combined_score"] = norm_df.mean(axis=1, skipna=True)
+        # ================= RESULTS TABLE =================
+        df_feat = pd.DataFrame(results).T
+        st.write("📊 Raw Feature Influence Metrics")
+        st.dataframe(df_feat.style.format("{:.4f}"))
 
-        st.write("Raw per-feature metrics (unsummarized):")
-        st.dataframe(df_feats.style.format("{:.4f}"))
+        # ================= NORMALIZATION =================
+        norm_df = (df_feat - df_feat.min()) / (df_feat.max() - df_feat.min())
+        norm_df["Combined Score"] = norm_df.mean(axis=1)
 
-        st.write("Normalized metrics and combined score (0-1):")
+        st.write("📈 Normalized Metrics & Combined Influence Score")
         st.dataframe(norm_df.style.format("{:.4f}"))
 
-        figc2, axc2 = plt.subplots(figsize=(7,3))
-        norm_df_sorted = norm_df.sort_values("combined_score", ascending=True)
-        axc2.barh(norm_df_sorted.index, norm_df_sorted["combined_score"], color="tab:blue")
-        axc2.set_xlabel("Combined normalized score (0-1)")
-        axc2.set_title("Feature Influence Combined Score")
-        st.pyplot(figc2)
+        # ================= BAR CHART =================
+        fig, ax = plt.subplots(figsize=(7, 4))
+        norm_df.sort_values("Combined Score").plot(
+            y="Combined Score", kind="barh", ax=ax, legend=False
+        )
+        ax.set_title("Combined Feature Influence Score (All XAI Methods)")
+        st.pyplot(fig)
+
+        st.info("""
+        **Interpretation**
+        - Higher combined score → feature is consistently important across XAI methods
+        - ALE improves reliability when features are correlated
+        - Agreement across SHAP + ALE + PDP = strongest evidence
+        """)
+
+    # ---------------- TAB: ALE (Accumulated Local Effects) ----------------
+    with tab7:
+        st.subheader("🟠 ALE (Accumulated Local Effects)")
+
+        st.markdown("""
+        **ALE explains how a feature affects PCOS prediction on average,  
+        while handling correlated features better than PDP.**
+        """)
+
+        feature_ale = st.selectbox(
+            "Select feature for ALE",
+            FEATURES,
+            index=FEATURES.index("amhng_ml")
+        )
+
+        try:
+            X_raw = df[FEATURES].copy()
+            values = X_raw[feature_ale].values
+
+            # ALE configuration
+            N_BINS = 10
+            bins = np.quantile(values, np.linspace(0, 1, N_BINS + 1))
+            bins = np.unique(bins)
+
+            ale_effects = []
+            bin_centers = []
+
+            # ---- Compute ALE ----
+            for i in range(len(bins) - 1):
+                low, high = bins[i], bins[i + 1]
+
+                mask = (values >= low) & (values < high)
+                if mask.sum() == 0:
+                    continue
+
+                X_low = X_raw.loc[mask].copy()
+                X_high = X_low.copy()
+
+                X_low[feature_ale] = low
+                X_high[feature_ale] = high
+
+                pred_low = model.predict_proba(
+                    preprocessor.transform(X_low)
+                )[:, 1]
+
+                pred_high = model.predict_proba(
+                    preprocessor.transform(X_high)
+                )[:, 1]
+
+                local_effect = np.mean(pred_high - pred_low)
+
+                ale_effects.append(local_effect)
+                bin_centers.append((low + high) / 2)
+
+            # Accumulate and center ALE
+            ale_effects = np.array(ale_effects)
+            ale_cum = np.cumsum(ale_effects)
+            ale_cum -= np.mean(ale_cum)
+
+            # ---- Plot ----
+            fig, ax = plt.subplots(figsize=(7, 4))
+            ax.plot(bin_centers, ale_cum, marker="o", linewidth=2)
+            ax.axhline(0, color="black", linestyle="--", linewidth=0.8)
+            ax.set_xlabel(feature_ale)
+            ax.set_ylabel("ALE effect on PCOS probability")
+            ax.set_title(f"ALE Plot for {feature_ale}")
+            ax.grid(True)
+
+            st.pyplot(fig)
+
+            # ---- Explanation ----
+            st.info(
+                f"""
+                **Interpretation:**  
+                - Values above zero increase PCOS probability  
+                - Values below zero decrease PCOS probability  
+                - ALE accounts for interactions with other hormones
+                """
+            )
+
+        except Exception as e:
+            st.error(f"ALE computation failed: {e}")
 
 # ---------- Bottom: Model summary ----------
 st.markdown("---")
