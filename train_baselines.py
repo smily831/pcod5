@@ -1,10 +1,19 @@
 import pandas as pd
-import numpy as np
 import joblib
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, f1_score, classification_report
+from sklearn.impute import SimpleImputer  # <--- FIXED: Needed to handle NaNs
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    confusion_matrix
+)
 import os
+import sys
 
 # --- Configuration ---
 RANDOM_STATE = 42
@@ -12,10 +21,15 @@ X_TRAIN_CSV = "X_train.csv"
 X_TEST_CSV = "X_test.csv"
 Y_TRAIN_CSV = "y_train.csv"
 Y_TEST_CSV = "y_test.csv"
-MODEL_FILE = "model_random_forest.joblib"  # The high-performing model to save
 FEATURE_NAMES_FILE = 'feature_names.joblib'
+IMPUTER_FILE = 'imputer.joblib'  # <--- New file to save the "filler" logic
 
 # 1. Load Data
+print("📦 Loading datasets...")
+if not os.path.exists(X_TRAIN_CSV):
+    print(f"❌ Error: {X_TRAIN_CSV} not found.")
+    sys.exit(1)
+
 X_train = pd.read_csv(X_TRAIN_CSV)
 X_test = pd.read_csv(X_TEST_CSV)
 y_train = pd.read_csv(Y_TRAIN_CSV).squeeze()
@@ -23,13 +37,28 @@ y_test = pd.read_csv(Y_TEST_CSV).squeeze()
 
 X_train_np = X_train.values
 X_test_np = X_test.values
-y_train_np = y_train.values
-y_test_np = y_test.values
+
+# --- 2. FIX: Handle Missing Values (Imputation) ---
+print("🔧 Imputing missing values...")
+# Create an imputer that fills blanks with the average (mean)
+imputer = SimpleImputer(strategy='mean')
+
+# Learn the averages from Train data and fill blanks
+X_train_np = imputer.fit_transform(X_train_np)
+
+# Fill blanks in Test data using the SAME averages (do not fit again!)
+X_test_np = imputer.transform(X_test_np)
+
+# Save the imputer so we can use it in the App/XAI later
+joblib.dump(imputer, IMPUTER_FILE)
+print(f"✅ Missing values filled & Imputer saved to: {IMPUTER_FILE}")
+
+# Save feature names once (shared by both models)
 feature_names = X_train.columns.tolist()
+joblib.dump(feature_names, FEATURE_NAMES_FILE)
+print(f"✅ Saved feature names to: {FEATURE_NAMES_FILE}")
 
-print(f"Loaded training data shape: {X_train.shape}")
-
-# 2. Define Models
+# 3. Define Models
 models = {
     "LogisticRegression": LogisticRegression(
         random_state=RANDOM_STATE,
@@ -44,53 +73,42 @@ models = {
     )
 }
 
-# 3. Training and Evaluation Loop
-results = {}
-best_auc = 0
-best_model_name = ""
-best_model = None
-
 print("\n--- Model Training & Evaluation ---")
 
+# 4. Loop through both models
 for name, model in models.items():
     print(f"\nTraining {name}...")
-    model.fit(X_train_np, y_train_np)
+    model.fit(X_train_np, y_train)
 
-    # Predict probabilities (for ROC AUC)
-    y_pred_proba = model.predict_proba(X_test_np)[:, 1]
-    # Predict class (for F1, Precision, Recall)
+    # Predictions
     y_pred = model.predict(X_test_np)
+    y_prob = model.predict_proba(X_test_np)[:, 1]
 
-    # Calculate metrics
-    auc = roc_auc_score(y_test_np, y_pred_proba)
-    f1 = f1_score(y_test_np, y_pred)
+    # --- Metrics ---
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob)
 
-    print(f"  ROC AUC: {auc:.4f}")
-    print(f"  F1 Score: {f1:.4f}")
+    report = classification_report(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
 
-    # Store results
-    results[name] = {
-        'AUC': auc,
-        'F1': f1,
-        'report': classification_report(y_test_np, y_pred, target_names=['No PCOS', 'PCOS'])
-    }
+    print(f"  > Accuracy : {accuracy:.4f}")
+    print(f"  > Precision: {precision:.4f}")
+    print(f"  > Recall   : {recall:.4f}")
+    print(f"  > F1 Score : {f1:.4f}")
+    print(f"  > ROC-AUC  : {auc:.4f}")
 
-    # Check for best model
-    if auc > best_auc:
-        best_auc = auc
-        best_model_name = name
-        best_model = model
+    print("\n  > Confusion Matrix:")
+    print(cm)
 
-# 4. Save Best Model and Feature Names
-joblib.dump(best_model, MODEL_FILE)
-print(f"\n✅ Saved best model ({best_model_name}, AUC: {best_auc:.4f}) to: {MODEL_FILE}")
+    print("\n  > Full Classification Report:")
+    print(report)
 
-# Save feature names, required for Anchor explainer initialization
-joblib.dump(feature_names, FEATURE_NAMES_FILE)
-print(f"Saved feature names to: {FEATURE_NAMES_FILE}")
+    # 💾 SAVE EACH MODEL
+    filename = f"model_{name}.joblib"
+    joblib.dump(model, filename)
+    print(f"  ✅ Saved model to: {filename}")
 
-# 5. Summary Report
-print("\n--- Final Classification Reports (Test Set) ---")
-for name, res in results.items():
-    print(f"\nReport for {name}:")
-    print(res['report'])
+print("\n🎉 Done! All models and tools are saved.")

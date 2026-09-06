@@ -2,6 +2,7 @@
 explain_with_shap_pcos_final.py
 ------------------------------------
 Generates SHAP explanations for the PCOS Random Forest model.
+Fixes: Shape mismatch errors for Random Forest (3D output).
 
 Outputs:
  - shap_outputs/shap_summary.png       (global summary plot)
@@ -30,7 +31,7 @@ PATIENT_INDEX = 0
 np.random.seed(RANDOM_STATE)
 random.seed(RANDOM_STATE)
 
-# helper (for legacy pipeline compatibility)
+# helper function (Must be defined for joblib to load the pipeline)
 def clip_nonnegative(X):
     X = np.array(X, dtype=float)
     X[X < 0] = 0.0
@@ -38,8 +39,13 @@ def clip_nonnegative(X):
 
 # ---------------- LOAD ----------------
 print("📦 Loading model + preprocessing pipeline...")
-preprocessor = joblib.load(PIPELINE_FILE)
-model = joblib.load(MODEL_FILE)
+try:
+    preprocessor = joblib.load(PIPELINE_FILE)
+    model = joblib.load(MODEL_FILE)
+except FileNotFoundError as e:
+    print(f"❌ Error: {e}")
+    print("Make sure .joblib files are in the same directory.")
+    exit()
 
 print("📄 Loading cleaned dataset...")
 df = pd.read_csv(CLEANED_CSV)
@@ -50,7 +56,6 @@ if not all(f in df.columns for f in features):
     raise ValueError(f"Missing expected features: {features}")
 
 X_raw = df[features]
-y = df[target] if target in df.columns else None
 
 # ---------------- TRANSFORM ----------------
 print("🔄 Transforming dataset with saved preprocessor...")
@@ -83,7 +88,7 @@ except Exception as e1:
     print("⚠️ Explainer() failed, trying TreeExplainer fallback:", e1)
     explainer = shap.TreeExplainer(model, feature_perturbation="interventional")
 
-# ---------------- GLOBAL EXPLANATION ----------------
+# ---------------- GLOBAL EXPLANATION (FIXED) ----------------
 n_global = min(SAMPLE_GLOBAL_N, X_proc.shape[0])
 X_sample = X_proc[np.random.choice(X_proc.shape[0], n_global, replace=False)]
 
@@ -94,16 +99,29 @@ except Exception as e:
     print("⚠️ SHAP call failed:", e)
     shap_values = explainer(X_sample)
 
+# Extract raw values
 vals = getattr(shap_values, "values", shap_values)
 vals = np.array(vals)
 
-if vals.ndim == 3:  # e.g. (n, 2, features)
-    vals = vals[:, 1, :]  # positive class (PCOS)
-    print("ℹ️ Multi-class SHAP detected → using positive class (PCOS).")
+print(f"ℹ️ Raw SHAP shape: {vals.shape}")
 
-if vals.shape[1] != X_sample.shape[1]:
-    print(f"⚠️ Fixing mismatch: SHAP {vals.shape} → data {X_sample.shape}")
-    vals = vals[:, :X_sample.shape[1]]
+# === FIX: Handle 3D Output (Samples, Features, Classes) ===
+if vals.ndim == 3:
+    # Check if the last dimension is classes (usually 2 for binary classification)
+    if vals.shape[2] == 2:
+        print("ℹ️ Multi-class SHAP detected (Rows, Features, Classes) -> Selecting Class 1 (PCOS)")
+        vals = vals[:, :, 1]  # Select Positive Class
+    elif vals.shape[1] == 2:
+        # Rare case: (Rows, Classes, Features)
+        print("ℹ️ Multi-class SHAP detected (Rows, Classes, Features) -> Selecting Class 1 (PCOS)")
+        vals = vals[:, 1, :]
+
+# Verify shapes match
+if vals.shape != X_sample.shape:
+    print(f"⚠️ Shape mismatch detected! SHAP: {vals.shape}, Data: {X_sample.shape}")
+    # Force alignment if dimensions are swapped
+    if vals.shape == (X_sample.shape[1], X_sample.shape[0]):
+        vals = vals.T
 
 fig = plt.figure(figsize=(8, 5))
 shap.summary_plot(vals, X_sample, feature_names=feature_names, show=False)
@@ -113,32 +131,45 @@ plt.savefig(summary_path)
 plt.close()
 print(f"✅ Saved global summary to: {summary_path}")
 
-# ---------------- LOCAL EXPLANATION ----------------
+# ---------------- LOCAL EXPLANATION (FIXED) ----------------
 print(f"👩‍⚕️ Generating local explanation for patient index {PATIENT_INDEX}...")
-if PATIENT_INDEX >= X_proc.shape[0]:
-    raise IndexError(f"Patient index {PATIENT_INDEX} out of range (max {X_proc.shape[0]-1}).")
 
 sample = X_proc[PATIENT_INDEX].reshape(1, -1)
 
 try:
     sample_expl = explainer(sample, check_additivity=False)
-except Exception as e:
-    print("⚠️ Fallback without additivity flag:", e)
+except Exception:
     sample_expl = explainer(sample)
 
-# Extract correct class
+# Extract values for single sample
 if hasattr(sample_expl, "values"):
     vals_local = np.array(sample_expl.values)
-    if vals_local.ndim == 3:
-        vals_local = vals_local[0, 1, :]  # positive class
-    elif vals_local.ndim == 2:
+else:
+    vals_local = np.array(sample_expl)
+
+# === FIX: Handle 3D Output for Local Sample ===
+if vals_local.ndim == 3:
+    # (1, Features, Classes) -> Select Class 1
+    vals_local = vals_local[0, :, 1]
+elif vals_local.ndim == 2:
+    if vals_local.shape[0] == 1:
+         # (1, Features) -> Flatten
         vals_local = vals_local[0]
     else:
-        vals_local = vals_local.ravel()
-else:
-    vals_local = np.array(sample_expl).ravel()
+        # (Features, Classes) -> Select Class 1
+        vals_local = vals_local[:, 1]
 
-base_val = getattr(sample_expl, "base_values", [0])[0]
+# Get base value (expected value)
+base_val = getattr(sample_expl, "base_values", [0])
+if isinstance(base_val, np.ndarray):
+    if base_val.ndim > 1 and base_val.shape[-1] == 2:
+        base_val = base_val[0, 1]  # Class 1 base value
+    else:
+        base_val = base_val.ravel()[0]
+elif isinstance(base_val, list):
+    base_val = base_val[0]
+
+# Construct Explanation Object
 explanation = shap.Explanation(
     values=vals_local,
     base_values=base_val,
